@@ -1,5 +1,5 @@
 # Long ncRNA-seq and Small ncRNA-seq analysis
-#### A collection of scripts for RNa-seq data analysis
+#### A collection of scripts for RNA-seq data analysis
 
 This repository currently contains a collection of R scripts and functions for analyzing RNA-seq datasets. 
 
