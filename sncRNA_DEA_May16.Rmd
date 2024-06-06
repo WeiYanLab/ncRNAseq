@@ -1,0 +1,1054 @@
+---
+title: "SmallRNA pipeline"
+author: "RDMM"
+date: "2024-05-13"
+---
+
+```{r, include=FALSE}
+#Basic libraries
+library(DESeq2)
+library(GenomicFeatures)
+library(rtracklayer)
+library(dplyr)
+library(openxlsx)
+library(BiocParallel)
+```
+
+
+```{r, include=FALSE}
+#Set path and load data ####
+setwd("/media/yanlab/HD2/WorkDirectory/Dr_gao_analysis/NewAnalysis/SncRNA/")
+
+#Load featureCounts data matrix
+data = read.delim("Read_Counts/featureCounts_AASRA.counts", skip = 1, header = 1, sep = "\t")
+
+#Correct the name of columns
+nameCol_v = gsub("Alignment_AASRA.","",colnames(data))
+nameCol_v = gsub("_R1.*","",nameCol_v)
+nameCol_v = gsub("[.]","",nameCol_v)
+colnames(data) = nameCol_v
+
+#Get minimal count tab
+tab = data[,c(1,7:dim(data)[2])]
+head(tab)
+
+#get the Identification 
+tab_ext = read.delim("rat_ncRNA_ref/Rattus_novergicus_SmallncRNA_Ref.tsv",header = T)
+tab_ext$Empty = NULL
+tab_ext$Name = gsub("Rattus_norvegicus_","",tab_ext$Header)
+tab_ext$Name = gsub(" .*","",tab_ext$Name)
+tab_ext = tab_ext[,c(1,6,2,3,4,5)]
+table(duplicated(tab_ext$Name))
+colnames(tab_ext)
+table(tab_ext$Type)
+head(tab_ext)
+
+info_features = tab_ext
+info_features$sRNA_type = gsub("_.*","",info_features$Type)
+
+```
+
+
+```{r}
+# Remove 3 samples with less than 1M total reads 
+colnames(tab)
+
+rm_Samples = c("AA31","JF38","JF7")
+write.xlsx(as.data.frame(rm_Samples),file = "drop_samples.xlsx")
+
+#check if samples names is in colnames
+table(rm_Samples %in% colnames(tab))
+
+# Get samples of interest to proceed with the analysis
+tab = tab[,!(colnames(tab) %in% rm_Samples)]
+colnames(tab)
+
+#check if samples names is NOT in colnames
+table(rm_Samples %in% colnames(tab))
+
+```
+
+```{r, include=FALSE}
+#Prepare Sample Dataframe ####
+#sdf
+sdf = data.frame("ID" = colnames(tab)[2:dim(tab)[2]])
+sdf$s_group = "x"
+sdf$s_group[grep("^AA",sdf$ID)] = "ATR"
+sdf$s_group[grep("^J",sdf$ID)] = "JEF"
+sdf$s_group[grep("^14C",sdf$ID)] = "CTR"
+sdf$s_group[grep("^AC",sdf$ID)] = "CTR"
+sdf$s_group[grep("^14D",sdf$ID)] = "DTT"
+sdf$s_group[grep("^14V",sdf$ID)] = "VIC"
+sdf$s_group[grep("^15V",sdf$ID)] = "VIC"
+sdf$s_group = as.factor(sdf$s_group)
+sdf$s_group = relevel(sdf$s_group,ref = "CTR")
+table(sdf$s_group)
+# rm(data)
+# gc()
+
+```
+
+```{r, include=FALSE}
+# function for DEA - selection of features with minimal of 20 counts.
+
+n_cores_v = 16
+q_value = 0.10 
+
+##############################################################################################
+#Get dds and rld values for each subtype  
+de_func = function(tab,df_deseq2,info_features_v,col_factor,n_cores_v,subtype_v,q_value,batch_group=0){
+  
+  if (subtype_v == "allSubtypes"){
+      cat(paste0("\n\nStarting ... ALL sRNA ...\n\n"))
+      print(paste0("Subtype with ",dim(tab)[1]," elements."))
+    
+  }  else {
+  cat(paste0("\n\nStarting ... ",subtype_v,"...\n\n"))
+  #Filter sRNA subtype
+    tab = tab[info_features$sRNA_type == subtype_v,]
+    print(paste0("Subtype with ",dim(tab)[1]," elements."))
+    
+    #Stop if no subtype founded
+    if(dim(tab)[1] == 0 ) {stop("No subset elements, check if subset name is in info_features table")}
+  }
+    
+    if(batch_group != 0){
+      print(paste0("# Get dds -DeseqDataSetFromMatrix... batch discount experiment: Group = ",batch_group))
+    design_formula <- as.formula(paste0("~ ",batch_group," + ",col_factor))
+    dds <- DESeqDataSetFromMatrix(countData = tab,
+                                  colData=df_deseq2, 
+                                  design=design_formula, 
+                                  tidy = TRUE)
+      
+    } else {
+      print("# Get dds -DeseqDataSetFromMatrix...")
+      design_formula <- as.formula(paste0("~0 + ",col_factor))
+      dds <- DESeqDataSetFromMatrix(countData=tab, 
+                                  colData=df_deseq2, 
+                                  design=design_formula, 
+                                  tidy = TRUE)
+    }
+    
+    #add info features to dds
+    if (subtype_v == "allSubtypes"){
+      print("add info to mcols no sRNA subtype...")
+      mcols(dds) = info_features
+    } else {
+      print(paste0("add info to mcols sRNA subtype... ",subtype_v))
+      mcols(dds) = info_features_v[info_features$sRNA_type == subtype_v,]
+    }
+    
+    #Get number of small RNA of this subset
+    features_num = dim(dds)[1]
+    
+    # #Pre-filtering ####
+    print("filtering...")
+    keep = rowSums(counts(dds))>= 20
+    keep_genes = table(keep)
+    dds <- dds[keep,]
+    print(paste0("Subtype with ",dim(dds)[1]," elements after filter."))
+   
+    #Stop if no feature with more than 20 counts for this subset
+    if(dim(dds)[1] == 0 ) {stop("No subset features with counts bigger than 20, check if there are some error or use a small filter")}
+    
+    #Get number of coding genes after filter
+    features_filter = dim(dds)[1]
+
+    #Using DESeq function for normalize and model fit ####
+    print("# Deseq2 function")
+    library(DESeq2)
+    library(BiocParallel)
+    register(MulticoreParam(n_cores_v))
+    
+    dds <- DESeq(dds, parallel = T)
+    
+    #Regularized log tranformation for data visualization and clustering
+    print("# Deseq2 function")
+    if (batch_group != 0){
+       print("rlog rm batch...")
+       rld = rlog(dds, blind = F)
+       rld_pca = rlog(dds, blind = T)
+       assay(rld) <- limma::removeBatchEffect(assay(rld), rld[[batch_group]])
+    }else {
+       print("rlog...")
+       rld = rlog(dds, blind = F)
+       rld_pca = rlog(dds, blind = T)
+    }
+     return(list("dds" = dds,"rld" = rld,"rld_pca" = rld_pca,"features_counts" = features_num, "filter_counts" = features_filter))
+
+}    
+
+  
+for (sR_sub in c(unique(info_features$sRNA_type))){
+  assign(paste0("ls_",sR_sub),de_func(tab,sdf,info_features,"s_group", n_cores_v,sR_sub,q_value))
+}    
+
+##############################################################
+#Get results for each contrast from each sncRNAs subtypes
+# Deseq Result function ####
+deseq2_res = function(dds_g,contrast_v,prefix_deseq,q_value){
+    #DESeqRulsts object
+    print("# resuslt from dds - res")
+    cat("Contrast=",contrast_v,'\n')
+    cat("prefix=",prefix_deseq,'\n')
+        
+    res <- results(dds_g, 
+                   contrast = contrast_v, 
+                   parallel = T, 
+                   alpha = q_value)
+    return(res)
+}
+
+#Contrast list:
+contrast_ls = list("ATRvsCTR" = c("s_group","ATR","CTR"),"VICvsCTR" = c("s_group","VIC","CTR"),"DTTvsCTR" = c("s_group","DTT","CTR"),"JEFvsCTR" = c("s_group","JEF","CTR"))
+names(contrast_ls)
+
+for (sR_sub in c(unique(info_features$sRNA_type))){
+  cat(sR_sub,'\n\n')
+  for (ct_v in 1:length(contrast_ls)){
+  contrast_name = names(contrast_ls[ct_v])
+  contrast_info = contrast_ls[[ct_v]]
+  assign(paste0("res_",sR_sub,"_",contrast_name),deseq2_res(get(paste0("ls_",sR_sub))$dds,contrast_info,contrast_name,q_value))
+    }
+}
+
+```
+
+```{r}
+# Construct result tables
+get_sig_func = function(res,additional_info_df,dirout,file_prefix){
+  dir.create(dirout, recursive = T, showWarnings = F)
+  res = merge(additional_info_df, as.data.frame(res), by.x="ID",by.y=0 , all.y = T)
+  res = res[order(res$padj),]
+
+  res_sig =  res[which(res$padj < 0.1 & abs(res$log2FoldChange) > 1),]
+  res_sig_up = res_sig[which(res_sig$log2FoldChange > 0),]
+  res_sig_dw = res_sig[which(res_sig$log2FoldChange < 0),]
+
+  data_to_save = list("AllFeatures" = res, "Significative_Features" = res_sig, "Sig_Features_UPReg" = res_sig_up, "Sig_Features_DWReg" = res_sig_dw)
+  write.xlsx(data_to_save,file = paste0(dirout,"/Results_DEA_",file_prefix,".xlsx"), rowNames = F)
+  return(res_sig)
+}
+
+#Main output directory
+dirout_v="DEA_results"
+
+for (sR_sub in c(unique(info_features$sRNA_type))){
+  cat(sR_sub,'\n\n')
+  add_info = mcols(get(paste0("ls_",sR_sub))$dds)[,1:7]
+  for (ct_v in 1:length(contrast_ls)){
+    contrast_name = names(contrast_ls[ct_v])
+    contrast_info = contrast_ls[[ct_v]]
+    dirout_contrast = paste0(dirout_v,"/",sR_sub,"/",contrast_name)
+  
+    assign(paste0("res_sig_",sR_sub,"_",contrast_name),get_sig_func(get(paste0("res_",sR_sub,"_",contrast_name)),add_info,dirout_contrast,contrast_name))
+    }
+}
+
+```
+
+
+# PCAplot
+
+### PCA Plot for RNA-seq:
+
+A PCA plot for RNA-seq samples is a graphical representation used to visualize the relationships and variations among gene transcription profiles in a high-dimensional RNA-seq dataset. It's a common technique in bioinformatics and genomics to gain insights into the structure of the data, identify patterns, and detect potential sources of variability.
+
+A PCA plot for RNA-seq samples is a scatter plot where each data point represents a sample, and the position of the point is determined by the values of its principal components. The first principal component (PC1) captures the most significant variation in the dataset, the second principal component (PC2) captures the second most, and so on.
+
+### Interpreting the Plot:
+
+In a PCA plot, samples that are close together are more similar in terms of their overall transcripts profiles. Conversely, samples that are farther apart have more dissimilar transcripts patterns. Clusters or groupings of samples indicate similar biological conditions or experimental treatments.
+
+A confidence interval of 70% was used for draw the ellipces around the sample groups.
+```{r, include = FALSE}
+# PCAplot ####
+
+#Additional libraries
+library(pheatmap)
+library(ggpubr)
+library(ggrepel)
+library(ellipse)
+library(magick)
+
+#Save and plot the results
+par(mar = c(4, 4, .1, .1))
+
+pcaplot_fun = function(rld_v,intergroup_v, ntop_v, dirout_v, prefix_deseq,filename_v){
+  dir.create(dirout_v, recursive = T)
+  pcaData <- plotPCA(rld_v, intgroup=intergroup_v , returnData=TRUE, ntop = ntop_v)
+  percentVar <- round(100 * attr(pcaData, "percentVar"))
+  
+  pcaData$label_v = gsub("[_]","",pcaData[[intergroup_v[2]]])
+  #pcaData$label_v = pcaData[[intergroup_v[2]]]
+  
+  p1 = ggplot(pcaData,aes(PC1, PC2, color=get(intergroup_v[1]))) +
+    geom_point(size =3,aes(fill = get(intergroup_v[1]))) +
+    geom_text_repel(aes(label = label_v,color = get(intergroup_v[1])) , size = 3, max.overlaps = 40) +
+    xlab(paste0("PC1: ",percentVar[1],"% variance")) +
+    ylab(paste0("PC2: ",percentVar[2],"% variance")) +
+    coord_fixed() + 
+    ggtitle(paste0("PCA plot ",prefix_deseq)) +
+    scale_color_discrete(name="Condition(Color)") +
+    scale_fill_discrete(name="Condition(Color)") +
+    scale_shape_manual(values=c(21,6),name="Time(Shape)") + 
+    stat_ellipse(aes(color = get(intergroup_v[1])), type = "norm", level = 0.70, linetype = "dashed", size = 0.5) +
+    theme_minimal() +
+    theme(plot.background = element_rect(fill = "white"),
+          text = element_text(size = 12), 
+          title = element_text(size = 16),  
+          axis.title = element_text(size = 14), 
+          legend.title = element_text(size = 14), 
+          legend.text = element_text(size = 12))
+    plot(p1)
+    
+    ggsave(p1, filename = paste0(dirout_v,"/",filename_v), device="png", width = 20, height = 20,units = "in",dpi = 300)
+    
+    gc()
+    #crop image
+      img <- image_read(paste0(dirout_v, "/",filename_v))
+      cropped_img <- image_trim(img)
+      image_write(cropped_img, path = paste0(dirout_v, "/",filename_v))
+}
+
+# pcaplot_fun(<rld>,<ID and groups column - no should named "group", cause conflict with PCADATA column>,<number of top variate fetures to be used>,<output dir>, <prefix for title> <file name for output>)
+
+for (sR_sub in c(c(unique(info_features$sRNA_type)))){
+      print(sR_sub)
+      pcaplot_fun(get(paste0("ls_",sR_sub))$rld_pca,c("s_group","ID"),500,paste0(dirout_v,"/",sR_sub),paste0(sR_sub),paste0("PCAplot_",sR_sub,"_top500.png"))
+}
+
+```
+
+```{r}
+# Separate the PCAplots per group - this is interesting to give a better view of the variation of the closest sample groups
+
+for (sR_sub in c(unique(info_features$sRNA_type))){
+  cat(sR_sub,'\n\n')
+    contrast_name = "ATRvsCTR"
+    cat("contrast=",contrast_name,'\n')
+    dirout_contrast = paste0(dirout_v,"/",sR_sub,"/",contrast_name)
+  
+    rld_temp_pca = get(paste0("ls_",sR_sub))$rld_pca
+    rld_temp_pca = rld_temp_pca[,grep("^14C|^AC|^AA",colnames(rld_temp_pca))]
+    pcaplot_fun(rld_temp_pca,c("s_group","ID"),500,dirout_contrast,contrast_name,paste0("PCAplot_",sR_sub,"_",contrast_name,"_top500.png"))
+}  
+
+for (sR_sub in c(unique(info_features$sRNA_type))){
+  cat(sR_sub,'\n\n')
+    contrast_name = "DTTvsCTR"
+    cat("contrast=",contrast_name,'\n')
+    dirout_contrast = paste0(dirout_v,"/",sR_sub,"/",contrast_name)
+  
+    rld_temp_pca = get(paste0("ls_",sR_sub))$rld_pca
+    rld_temp_pca = rld_temp_pca[,grep("^14C|^AC|^14D",colnames(rld_temp_pca))]
+    pcaplot_fun(rld_temp_pca,c("s_group","ID"),500,dirout_contrast,contrast_name,paste0("PCAplot_",sR_sub,"_",contrast_name,"_top500.png"))
+}  
+
+for (sR_sub in c(unique(info_features$sRNA_type))){
+  cat(sR_sub,'\n\n')
+    contrast_name = "VICvsCTR"
+    cat("contrast=",contrast_name,'\n')
+    dirout_contrast = paste0(dirout_v,"/",sR_sub,"/",contrast_name)
+  
+    rld_temp_pca = get(paste0("ls_",sR_sub))$rld_pca
+    rld_temp_pca = rld_temp_pca[,grep("^14C|^AC|^14V|^15V",colnames(rld_temp_pca))]
+    pcaplot_fun(rld_temp_pca,c("s_group","ID"),500,dirout_contrast,contrast_name,paste0("PCAplot_",sR_sub,"_",contrast_name,"_top500.png"))
+}  
+
+for (sR_sub in c(unique(info_features$sRNA_type))){
+  cat(sR_sub,'\n\n')
+    contrast_name = "JEFvsCTR"
+    cat("contrast=",contrast_name,'\n')
+    dirout_contrast = paste0(dirout_v,"/",sR_sub,"/",contrast_name)
+  
+    rld_temp_pca = get(paste0("ls_",sR_sub))$rld_pca
+    rld_temp_pca = rld_temp_pca[,grep("^14C|^AC|^JF",colnames(rld_temp_pca))]
+    pcaplot_fun(rld_temp_pca,c("s_group","ID"),500,dirout_contrast,contrast_name,paste0("PCAplot_",sR_sub,"_",contrast_name,"_top500.png"))
+}  
+
+```
+
+### Interactive 3D PCAplot
+
+```{r, include=FALSE}
+#3D PCAplot
+
+pcaplot_3d_fun = function(rld_v,intergroup_v, ntop_v, dirout_v){
+    library(pcaExplorer)
+    pca3d = pcaplot3d(rld_v,intgroup = intergroup_v[1], ntop = ntop_v, text_labels = T, point_size = 1)
+    
+    saveRDS(pca3d, file = paste0(dirout_v,"/PCAplot3D.rds"))
+    
+    htmlwidgets::saveWidget(widget = pca3d, file = paste0(dirout_v,"/PCAplot3D_",ntop_v,".html"), selfcontained = T)
+    
+    pcaplot3d(rld_v,intgroup = intergroup_v[1], ntop = ntop_v, text_labels = T, point_size = 1)
+}
+
+#All samples c1
+for (sR_sub in c(c(unique(info_features$sRNA_type)))){
+  print(sR_sub)
+      pcaplot_3d_fun(get(paste0("ls_",sR_sub))$rld,c("s_group","ID"),500,paste0(dirout_v,"/",sR_sub))
+}
+
+```
+
+### Euclidean distance between samples
+
+```{r, include = FALSE}
+# Euclidian distance between samples ###
+
+library(RColorBrewer)
+
+euclidian_dist_func = function(rld_v,dirout_v,h_v,w_v){
+  sampleDists = dist(t(assay(rld_v)))
+  sampleDistMatrix <- as.matrix( sampleDists )
+  rownames(sampleDistMatrix) <- colnames(rld_v)
+  colnames(sampleDistMatrix) <- NULL
+  colors <- colorRampPalette( rev(brewer.pal(9, "Blues")) )(255)
+
+  png(file = paste0(dirout_v,"/Heatmap_Samples_EuclidianDist.png"), height = h_v, width = w_v, units = "in", res = 300)
+  pheatmap(sampleDistMatrix,
+         clustering_distance_rows = sampleDists,
+         clustering_distance_cols = sampleDists,
+         col = colors)
+  dev.off()
+}
+
+#euclidian_dist_func(rld, dirout_v, height,width)
+for (sR_sub in c(c(unique(info_features$sRNA_type)))){
+      print(sR_sub)
+      euclidian_dist_func(get(paste0("ls_",sR_sub))$rld,paste0(dirout_v,"/",sR_sub),15,15)
+}
+
+
+
+```
+
+
+### Plot row standard deviations versus row means
+
+Standard deviation and mean are calculated row-wise from the expression normalized matrix (in this case by DESeq2 regularized log transformation method). The scatterplot of these versus each other allows you to visually verify whether there is a dependence of the standard deviation (or variance) on the mean. The red line depicts the running median estimator (window-width 10%). If there is no variance-mean dependence, then the line should be approximately horizontal. Ref. <https://rdrr.io/bioc/vsn/man/meanSdPlot.html>
+
+```{r, include=FALSE}
+### Plot row standard deviations versus row means
+
+library(vsn)
+meansdplot_func = function(rld_v, dirout_v){
+  png(paste0(dirout_v,"/meanSdPlot.png"),height = 5, width = 5, unit = "in",res = 300)
+  meanSdPlot(assay(rld_v))
+  dev.off()
+}
+
+for (sR_sub in c(c(unique(info_features$sRNA_type)))){
+      meansdplot_func(get(paste0("ls_",sR_sub))$rld,paste0(dirout_v,"/",sR_sub))
+}
+
+```
+
+```{r, include=FALSE}
+#Summary file with total features, filtered features numbers, design and size factors information
+summary_func = function(ls_v,prefix_deseq,dirout_v){ 
+  # Summary file
+  sink(paste0(dirout_v,"/",prefix_deseq,"_result_summary.txt"))
+  cat("## Total Features: ",ls_v$features_counts,"\n")
+  cat("\n## Features with mote than 20 counts: ",ls_v$filter_counts,"\n")
+  cat("\n## Design and SizeFactors ##\n")
+  print(as.data.frame(colData(ls_v$dds)),nrow = 1000)
+  sink()
+}  
+
+for (sR_sub in c(c(unique(info_features$sRNA_type)))){
+      print(sR_sub)
+      summary_func(get(paste0("ls_",sR_sub)), sR_sub, paste0(dirout_v,"/",sR_sub))
+}
+
+```
+
+### Volcano plot
+The volcano plot visualizes differential lncRNA transcription between two conditions. Each point represents a gene, plotted based on its log2 fold change (x-axis) and statistical significance (-log10 p-value, y-axis). Purple points indicate downregulated lncRNAs with significant adjusted p-values (adj.p < 0.1) and significant FC (log2FC < -1), dark green points indicate upregulated lncRNAs with significant adjusted p-values (adj.p < 0.1) and significant FC (log2FC > 1), and grey points represent lncRNAs with non-significant regulation.
+
+```{r, include = FALSE}
+# Volcano plot - adjpvalue and lfc
+volcanoP_func = function(res_object_v, prefix_deseq, dirout_deseq,alpha_padj=0.05,lfc=0,show.labels = F,info_table = NULL){
+  if (lfc == 0){
+    legend_names = c("Not Sig.", paste0("Adj.p < ",alpha_padj))
+  } else {
+    legend_names = c("Not Sig.", paste0("Adj.p < ",alpha_padj,"; FC > ",2^lfc))
+  }
+  
+  results = as.data.frame(res_object_v)
+  results$sig = "NonSig"
+  results$sig[((res_object_v$padj< alpha_padj) & (res_object_v$log2FoldChange > lfc))] = "SigUP"
+  results$sig[((res_object_v$padj< alpha_padj) & (res_object_v$log2FoldChange < -lfc))] = "SigDW"
+  results$sig = factor(results$sig, levels = c("NonSig","SigUP","SigDW"))
+  
+  #Remove NAs caused by Deseq2 inner filter.
+  results = na.omit(results)
+  
+  results = results[order(results$pvalue),]
+  
+  if(any(length(info_table))){
+    rownames(results) = info_table[match(rownames(results),info_table[,1]),2]
+  }
+  
+  DEgenes_DESeq <- results[which(abs(results$log2FoldChange) > lfc & results$padj < alpha_padj),]
+  
+  p = ggplot(results, aes(log2FoldChange, -log10(pvalue))) +
+      geom_point(aes(col = sig)) +
+      scale_color_manual(values = c("NonSig" = alpha("grey20",0.2), "SigUP" = "seagreen4","SigDW" = "mediumorchid4")) + 
+      ggtitle(paste0("Volcano Plot: ",prefix_deseq)) + 
+      guides(color=guide_legend(title=NULL)) +
+      geom_hline(yintercept = -log(0.05,10), colour="black", size=0.2, linetype="longdash") + 
+      geom_vline(xintercept = 1, colour="black", size=0.2, linetype="dashed") + 
+  geom_vline(xintercept = -1, colour="black", size=0.2, linetype="dashed") + 
+      theme_bw() + 
+      theme(legend.position = "bottom",
+            axis.text = element_text(size = 10),
+            axis.title = element_text(size = 12, face = "italic"),
+            plot.title = element_text(size = 15, face = "italic"),
+            plot.caption = element_text(face = "italic"))  
+      
+  # Labels if more than 20 only label 10 genes
+
+if(show.labels == T){
+# Print labels for sig genes
+  if((sum((abs(results$log2FoldChange) > lfc & results$padj < alpha_padj),na.rm = T) != 0)){
+      # size of the significant labels
+      size_v = 3
+      if(sum((abs(results$log2FoldChange) > lfc & results$padj < alpha_padj),na.rm = T) < 20){
+               p = p + geom_text_repel(data = dplyr::filter(results, padj<alpha_padj & abs(log2FoldChange)>lfc), aes(label = rownames(filter(results, padj<alpha_padj & abs(log2FoldChange)>lfc)), col = sig),max.overlaps = 20, size = size_v, show.legend = F)
+      } else {
+               p = p + geom_text_repel(data=dplyr::filter(results, (padj<alpha_padj & abs(log2FoldChange)>lfc))[1:10,], aes(label=rownames(dplyr::filter(results, (padj<alpha_padj & abs(log2FoldChange)>lfc))[1:10,]), col = sig), size = size_v, show.legend = F)
+      }
+ }
+ }
+  suppressWarnings(plot(p))
+    
+  ggsave(p, file = paste0(dirout_deseq,"/",prefix_deseq,"_VolcanoPlot.png"), device = "png", height = 5.5, width = 5.5, unit = "in",dpi = 300)
+}
+
+
+
+for (sR_sub in c(unique(info_features$sRNA_type))){
+  cat(sR_sub,'\n\n')
+  for (ct_v in 1:length(contrast_ls)){
+    contrast_name = names(contrast_ls[ct_v])
+    contrast_info = contrast_ls[[ct_v]]
+    cat("contrast=",contrast_name,'\n')
+    dirout_contrast = paste0(dirout_v,"/",sR_sub,"/",contrast_name)
+  
+    volcanoP_func(get(paste0("res_",sR_sub,"_",contrast_name)),paste0(sR_sub,"_",contrast_name),dirout_contrast,0.1,1,show.labels = F, info_table = info_features[,c(1,2)])
+    }
+}
+
+```
+
+```{r}
+#################################################################
+# heatmap with fixed samples
+
+heatmap_fun2_pf = function(rld_v,res,dirout_deseq,prefix_deseq,alpha_padj=0.05,lfc=0,height_v=5,width_v=5,show_row=T,order_group = 0,info_table=NULL){
+  
+  if(any(length(info_table))){
+    rownames(res) = info_table[match(rownames(res),info_table[,1]),2]
+    rownames(rld_v) = info_table[match(rownames(rld_v),info_table[,1]),2]
+  }
+  
+  df_geneids_v = res[which(res$padj < alpha_padj & abs(res$log2FoldChange)>lfc),]
+  df_geneids_v = df_geneids_v[order(df_geneids_v$log2FoldChange, decreasing = T),]
+  
+  geneids_v = row.names(df_geneids_v)
+  print(length(geneids_v))
+
+  
+  if(length(geneids_v) > 1){
+    assay_v = assay(rld_v)
+    y <- assay_v[geneids_v,]
+      y <- y[rowSums(y[]) > 0, ]
+      
+      group_names = unique(as.character(colData(rld_v)$s_group))
+      
+      gray_palette <- colorRampPalette(c("black", "grey90"))
+      group_colors = gray_palette(length(group_names))
+      names(group_colors) = group_names
+      
+      
+      if(any(order_group != 0)){
+        group_order = order(factor(as.character(colData(rld_v)$s_group),levels = order_group))
+      } else {
+        group_order <- order(colData(rld_v)$s_group)
+      }
+      
+      y_sort = y[,group_order]
+      annot_c = data.frame("Samples" = as.character(colData(rld_v)$s_group)[group_order])
+      rownames(annot_c) = colData(rld_v)$ID[group_order]
+      
+      annot_r = data.frame("Reg" = ifelse(df_geneids_v$log2FoldChange > 0, "UP","DW"))
+      rownames(annot_r) = rownames(df_geneids_v)
+  
+      png(paste0(dirout_deseq,"/",prefix_deseq,"_DEG_Heatmap2.png"), height = height_v, width = width_v, res= 300, units = "in")
+      pheatmap(y_sort, scale = "row", 
+               #clustering_distance_rows = "correlation",
+               treeheight_col = FALSE,
+               show_rownames = show_row,
+               border_color = "white",
+               border_width = 3,
+               cellwidth = 2.5,
+               #gaps_col = cumsum(c(1,1)),
+               main = prefix_deseq,
+               cluster_cols = F,
+               cluster_rows = F,
+               annotation_col = annot_c,
+               annotation_row = annot_r,
+               annotation_colors = list("Samples" = group_colors,"Reg" = c("UP" = "seagreen4","DW" = "mediumorchid4")),
+               fontsize_col = 3,
+               fontsize_row = 2.5,
+               color = colorRampPalette(c("mediumorchid4","white","seagreen4"))(100),
+               #breaks = seq(-1,1, by = 0.1)
+               )
+      dev.off()
+    } else {
+        message <- "Heatmap for DEG not printed - Less than 2 genes."
+        print(message)
+        png_filename <- paste0(dirout_deseq,"/",prefix_deseq,"_DEG_Heatmap2.png")
+        png(png_filename, height = 0.5, width = 5, res = 300, units = "in")
+        grid.newpage()
+        grid.text(message, x = 0.5, y = 0.5, just = "center", gp = gpar(fontsize = 14))
+        dev.off()
+    }
+}
+
+
+for (sR_sub in c(unique(info_features$sRNA_type))){
+  cat(sR_sub,'\n\n')
+    contrast_name = "ATRvsCTR"
+    cat("contrast=",contrast_name,'\n')
+    dirout_contrast = paste0(dirout_v,"/",sR_sub,"/",contrast_name)
+  
+    rld_temp = get(paste0("ls_",sR_sub))$rld
+    rld_temp = rld_temp[,grep("^14C|^AC|^AA",colnames(rld_temp))]
+    res_temp = get(paste0("res_",sR_sub,"_",contrast_name))
+    heatmap_fun2_pf(rld_temp,res_temp,dirout_contrast,paste0(sR_sub,"_",contrast_name),0.1,1,info_table = info_features[,c(1,2)],show_row = F,order_group = c("ATR","CTR"))
+}  
+
+for (sR_sub in c(unique(info_features$sRNA_type))){
+  cat(sR_sub,'\n\n')
+    contrast_name = "DTTvsCTR"
+    cat("contrast=",contrast_name,'\n')
+    dirout_contrast = paste0(dirout_v,"/",sR_sub,"/",contrast_name)
+  
+    rld_temp = get(paste0("ls_",sR_sub))$rld
+    rld_temp = rld_temp[,grep("^14C|^AC|^14D",colnames(rld_temp))]
+    res_temp = get(paste0("res_",sR_sub,"_",contrast_name))
+    heatmap_fun2_pf(rld_temp,res_temp,dirout_contrast,paste0(sR_sub,"_",contrast_name),0.1,1,info_table = info_features[,c(1,2)],show_row = F, order_group = c("DTT","CTR"))
+}  
+
+for (sR_sub in c(unique(info_features$sRNA_type))){
+  cat(sR_sub,'\n\n')
+    contrast_name = "VICvsCTR"
+    cat("contrast=",contrast_name,'\n')
+    dirout_contrast = paste0(dirout_v,"/",sR_sub,"/",contrast_name)
+  
+    rld_temp = get(paste0("ls_",sR_sub))$rld
+    rld_temp = rld_temp[,grep("^14C|^AC|^14V|^15V",colnames(rld_temp))]
+    res_temp = get(paste0("res_",sR_sub,"_",contrast_name))
+    heatmap_fun2_pf(rld_temp,res_temp,dirout_contrast,paste0(sR_sub,"_",contrast_name),0.1,1,info_table = info_features[,c(1,2)],show_row = F, order_group = c("VIC","CTR"))
+}  
+
+for (sR_sub in c(unique(info_features$sRNA_type))){
+  cat(sR_sub,'\n\n')
+    contrast_name = "JEFvsCTR"
+    cat("contrast=",contrast_name,'\n')
+    dirout_contrast = paste0(dirout_v,"/",sR_sub,"/",contrast_name)
+  
+    rld_temp = get(paste0("ls_",sR_sub))$rld
+    rld_temp = rld_temp[,grep("^14C|^AC|^JF",colnames(rld_temp))]
+    res_temp = get(paste0("res_",sR_sub,"_",contrast_name))
+    heatmap_fun2_pf(rld_temp,res_temp,dirout_contrast,paste0(sR_sub,"_",contrast_name),0.1,1,info_table = info_features[,c(1,2)],show_row = F, order_group = c("JEF","CTR"))
+}  
+
+```
+
+
+```{r}
+# Heatmap with all contrasts:
+
+#This function consider the normalized table for all contrasts. Not should be used for pairwise comparison excluding sample groups. Only use when rld or vst was produced using all the sample groups.
+library(pheatmap)
+library(grid)
+library(VennDiagram)
+
+heatmap_for_all_ct = function(list_res, rld, list_name, outfile,alpha_padj, lfc, factor_column){
+
+      list_det = lapply(list_res, function(x) rownames(x)[which(x$padj < alpha_padj)])
+
+      list_det_up = lapply(list_res, function(x) rownames(x)[which(x$padj < alpha_padj & x$log2FoldChange >= lfc)])
+      list_det_dw = lapply(list_res, function(x) rownames(x)[which(x$padj < alpha_padj & x$log2FoldChange <= lfc)])
+
+
+      det = unique(unlist(list_det))
+      cat("number of DET:",length(det),"\n")
+
+      if(length(det) > 1){
+
+          rld_in = rld[rownames(rld) %in% det,]
+          y = assay(rld_in)
+
+          group_order <- factor(order(colData(rld_in)[[factor_column]]))
+          annot_c = data.frame("Samples" = colData(rld_in)[[factor_column]][group_order])
+          rownames(annot_c) = colData(rld_in)$ID[group_order]
+
+          y = y[,group_order]
+
+          df_t = data.frame(Gene_ID = rownames(y))
+          c_v = 1
+          for (ct in list_name){
+            df_t[[ct]] = ifelse(df_t$Gene_ID %in% list_det[[c_v]], "Yes","No")
+            c_v = c_v + 1
+          }
+
+          row.names(df_t) = df_t$Gene_ID
+
+          # Define colors for row annotations
+          
+          #Column colors - Samples
+          group_names = unique(colData(rld)[[factor_column]])
+          group_names = sort(group_names)
+          gray_palette <- colorRampPalette(c("black", "grey90"))
+          samplescolors = gray_palette(length(group_names))
+          names(samplescolors) = group_names
+          
+          #samplescolors = paste0("grey",seq(40,90,length.out = length(unique(colData(rld_in)$group))))
+          
+          #Row colors
+          annotcolors = rainbow(length(list_res))
+          colors = list()
+          c_v2 = 1
+          for (names_v in list_name){
+            colors[[names_v]] = c("grey95",annotcolors[c_v2])
+            names(colors[[names_v]]) = c("No","Yes")
+            c_v2 = c_v2 + 1
+          }
+
+          colors[["Samples"]] = samplescolors
+          #names(colors[["Samples"]]) = unique(colData(rld_in)$group)
+
+          #my_colors <- colorRampPalette(c("mediumorchid4","white","seagreen4"))(n = 100)
+
+          png(outfile, height = 8, width = 10, res= 300, units = "in")
+          pheatmap(y, scale = "row", clustering_distance_rows = "correlation",
+                         treeheight_col = FALSE,
+                         show_rownames = FALSE,
+                         main = "Differential lncRNAs",
+                         cluster_cols = F,
+                         annotation_col = annot_c,
+                   annotation_row = df_t[2:dim(df_t)[2]],
+                   annotation_colors = colors,
+                   color = colorRampPalette(c("mediumorchid4","white","seagreen4"))(100),
+                   fontsize_col = 5
+                   #color = my_colors
+                         )
+          dev.off()
+
+          
+          ######VENN DIAGRAM ####################################
+          venn_func = function(){
+                # Create Venn Diagram - more than 3 groups need to change color atribution
+                print("Venn diagram...")
+                #new outfile
+                outfile_veen = gsub(".png", "_Venn.png", outfile)
+                outfile_veen_up = gsub(".png", "_Venn_UP.png", outfile)
+                outfile_veen_dw = gsub(".png", "_Venn_DW.png", outfile)
+                #new alpha annot_colors
+                annotcolors_with_alpha <- sapply(annotcolors, function(color) {
+          alpha(color, 0.3)
+        })
+        
+                print(outfile_veen)
+                #all lncRNAs
+                print(list_det)
+                venn.diagram(list_det,
+                            category.names = list_name ,
+                            disable.logging = TRUE,
+                            filename = outfile_veen,
+                            output = TRUE ,
+                            imagetype="png" ,
+                            height = 480 ,
+                            width = 480 ,
+                            resolution = 300,
+                            compression = "lzw",
+                            lwd = 1,
+                            col = annotcolors,
+                            fill = annotcolors_with_alpha,
+                            cex = 0.5,
+                            fontfamily = "sans",
+                            cat.cex = 0.4,
+                            cat.default.pos = "outer",
+                            #cat.pos = c(-27, 27, 135),
+                            #cat.dist = c(0.055, 0.055, 0.085),
+                            cat.fontfamily = "sans",
+                            #cat.col = annotcolors,
+                            #rotation = 1,
+                            margin = 0.08)
+  
+
+                    #up reg venn
+                    venn.diagram(list_det_up,
+                              category.names = list_name,
+                              disable.logging = TRUE,
+                              filename = outfile_veen_up,
+                              output = TRUE ,
+                              imagetype="png" ,
+                              height = 480 ,
+                              width = 480 ,
+                              resolution = 300,
+                              compression = "lzw",
+                              lwd = 1,
+                              col = annotcolors,
+                              fill = annotcolors_with_alpha,
+                              cex = 0.5,
+                              fontfamily = "sans",
+                              cat.cex = 0.4,
+                              cat.default.pos = "outer",
+                              #cat.pos = c(-27, 27, 135),
+                              #cat.dist = c(0.055, 0.055, 0.085),
+                              cat.fontfamily = "sans",
+                              #cat.col = annotcolors,
+                              #rotation = 1, 
+                              margin = 0.08)
+                    
+                    #Dw reg venn
+                    venn.diagram(list_det_dw,
+                              category.names = list_name,
+                              disable.logging = TRUE,
+                              filename = outfile_veen_dw,
+                              output = TRUE ,
+                              imagetype="png" ,
+                              height = 480 ,
+                              width = 480 ,
+                              resolution = 300,
+                              compression = "lzw",
+                              lwd = 1,
+                              col = annotcolors,
+                              fill = annotcolors_with_alpha,
+                              cex = 0.5,
+                              fontfamily = "sans",
+                              cat.cex = 0.4,
+                              cat.default.pos = "outer",
+                              #cat.pos = c(-27, 27, 135),
+                              #cat.dist = c(0.055, 0.055, 0.085),
+                              cat.fontfamily = "sans",
+                              #cat.col = annotcolors,
+                              #rotation = 1, 
+                              margin = 0.08)
+                }
+               
+          #run functiion:
+          venn_func()
+          
+        #return(list("list_det" = list_det,"list_name" = list_name,"annotcolors" = annotcolors))
+          
+      } else {
+        message <- "Heatmap for DEG not printed - Less than 2 genes."
+        print(message)
+        png_filename <- outfile
+        png(png_filename, height = 0.5, width = 5, res = 300, units = "in")
+        grid.newpage()
+        grid.text(message, x = 0.5, y = 0.5, just = "center", gp = gpar(fontsize = 14))
+        dev.off()
+      }
+
+}
+
+for (sR_sub in c(unique(info_features$sRNA_type))){
+  cat(sR_sub,'\n\n')
+    contrast_res_ls = mget(paste0("res_",sR_sub,"_",names(contrast_ls)))
+    contrast_name_ls = as.list(names(contrast_ls))
+    dirout_contrast = paste0(dirout_v,"/",sR_sub)
+    
+    heatmap_for_all_ct(contrast_res_ls, get(paste0("ls_",sR_sub))$rld, contrast_name_ls, paste0(dirout_contrast,"/Heatmap_ALLcontrasts_",sR_sub,".png"),0.1,1,factor_column = "s_group")
+}
+
+```
+
+```{r, include = FALSE}
+
+# Bidirectional plot
+bidirectPlot_fun = function(res,prefix_deseq,dirout_v,alpha_padj=0.05, lfc = 0,subtype_name){
+    if(class(res) == "list"){
+          # Loop through the list of dataframes in res_list
+          if(class(prefix_deseq) != "list") stop("Prefix is not a list... plz convert prefix to a list with diferent contrast names for plot.")
+            
+          combined_df = data.frame()
+          for (i in 1:length(res)) {
+            tab <- as.data.frame(res[[i]])
+            
+            c1 <- rep(prefix_deseq[[i]], 2)
+            c2 <- c("UP", "DW")
+            c3 <- c(sum(tab$log2FoldChange > lfc & tab$padj < alpha_padj, na.rm = TRUE),
+                     sum(tab$log2FoldChange < -lfc & tab$padj < alpha_padj, na.rm = TRUE))
+            
+            # Make a dataframe for the current contrast
+            df_updw <- data.frame("ID" = c1, "Reg" = c2, "Num" = c3)
+            
+            # Add the current contrast dataframe to the combined dataframe
+            combined_df <- rbind(combined_df, df_updw)
+        }
+        # Calculate the number of contrasts
+        num_contrasts <- length(res)
+        
+        #order the contrast as prefix_deseq in function (botton to up in the plot)
+        combined_df$ID = factor(combined_df$ID,levels = prefix_deseq)
+          
+    } else {
+        tab = as.data.frame(res)
+        c1 = rep(prefix_deseq,2)
+        c2 = c("UP","DW")
+        c3 = c(sum(tab$log2FoldChange > lfc  & tab$padj < alpha_padj, na.rm = T),sum(tab$log2FoldChange < -lfc  & tab$padj < alpha_padj, na.rm = T))
+        #Make table
+        combined_df = data.frame("ID" = c1,"Reg" = c2 , "Num" = c3)
+        # Number of contrasts is 1 in this case
+        num_contrasts = 1
+        
+    }
+
+    #Negative values for DW reg sRNAs
+    combined_df[combined_df$Reg == "DW","Num"] = combined_df[combined_df$Reg == "DW","Num"]*-1
+    
+    # Calculate the height of the plot based on the number of contrasts keep the bar_width constant (constant numbers get from initial test using only 1 contrast)
+    bar_width = 0.75
+    plot_height = (2.3-bar_width) + (num_contrasts * bar_width)  # Adjust the multiplier as needed
+ 
+    #Plot
+    p_bp = ggplot(combined_df, aes(x = ID, y = Num, group = Reg, fill = Reg)) +
+      geom_bar(stat = "identity", width = bar_width) +
+      #geom_label(data = subset(df_updw, Num != 0),
+      geom_label(position = position_dodge(width = bar_width),
+                 aes(label = abs(Num)), fill = "white", alpha = 0.6) +
+      coord_flip() +
+      labs(x = "Contrasts", y = paste0("# of ",subtype_name,"s"), title = paste0("Differentialy Transcribed ",subtype_name,"s\nAdj.p-value < ",alpha_padj, "; |log2FC| > ",lfc)) +
+      theme_bw() +
+      theme(legend.position = "top",
+            legend.title = element_blank(),
+            axis.title.y = element_text(size = 8, face = "italic"),
+            axis.text.y = element_text(size = 10, face = "bold"),
+            plot.title = element_text(hjust = 0.5),
+            panel.background = element_rect(fill =  "grey98")) +
+      # reverse the order of items in legend
+      guides(fill = guide_legend(reverse = TRUE)) +
+      # change the default colors of bars
+      scale_fill_manual(values=c("seagreen4", "mediumorchid4"),
+                        name="",
+                        breaks=c("UP", "DW"),
+                        labels=c("UP", "DW"))
+     plot(p_bp)
+    
+    if(class(prefix_deseq) == "list") {
+        ggsave(p_bp, filename = paste0(dirout_v,"/Bidirectional_Barplot.png"), device = "png", unit = "in", width = 10, height = plot_height, dpi = 300)  
+    } else {
+        ggsave(p_bp, filename = paste0(dirout_v,"/",prefix_deseq,"_Bidirectional_Barplot.png"), device = "png", unit = "in", width = 10, height = plot_height, dpi = 300)
+    }
+}
+
+# Can be used a list of res and a list of prefix to plot one row for aech contrast.
+#bidirectPlot_fun(list(ls_HvsI$res,ls_HvsI$res,ls_HvsI$res,ls_HvsI$res,ls_HvsI$res),list("sss","asda",prefix_deseq,"HEvsRD","DSvsDS"),dirout_v,q_value)
+
+for (sR_sub in c(unique(info_features$sRNA_type))){
+  cat(sR_sub,'\n\n')
+  for (ct_v in 1:length(contrast_ls)){
+    contrast_name = names(contrast_ls[ct_v])
+    contrast_info = contrast_ls[[ct_v]]
+    cat("contrast=",contrast_name,'\n')
+    dirout_contrast = paste0(dirout_v,"/",sR_sub,"/",contrast_name)
+   
+    bidirectPlot_fun(get(paste0("res_",sR_sub,"_",contrast_name)),contrast_name,dirout_contrast,0.1,1,sR_sub)
+    }
+}
+
+for (sR_sub in c(unique(info_features$sRNA_type))){
+  cat(sR_sub,'\n\n')
+    contrast_res_ls = mget(paste0("res_",sR_sub,"_",names(contrast_ls)))
+    contrast_name_ls = as.list(names(contrast_ls))
+    dirout_contrast = paste0(dirout_v,"/",sR_sub)
+
+    bidirectPlot_fun(contrast_res_ls,contrast_name_ls,dirout_contrast,0.1,1,sR_sub)
+}
+
+```
+
+```{r}
+sessionInfo()
+```
+
+R version 4.3.3 (2024-02-29)
+Platform: x86_64-pc-linux-gnu (64-bit)
+Running under: Ubuntu 22.04.4 LTS
+
+Matrix products: default
+BLAS:   /usr/lib/x86_64-linux-gnu/openblas-pthread/libblas.so.3 
+LAPACK: /usr/lib/x86_64-linux-gnu/openblas-pthread/libopenblasp-r0.3.20.so;  LAPACK version 3.10.0
+
+locale:
+ [1] LC_CTYPE=en_US.UTF-8       LC_NUMERIC=C               LC_TIME=en_US.UTF-8        LC_COLLATE=en_US.UTF-8    
+ [5] LC_MONETARY=en_US.UTF-8    LC_MESSAGES=en_US.UTF-8    LC_PAPER=en_US.UTF-8       LC_NAME=C                 
+ [9] LC_ADDRESS=C               LC_TELEPHONE=C             LC_MEASUREMENT=en_US.UTF-8 LC_IDENTIFICATION=C       
+
+time zone: America/Los_Angeles
+tzcode source: system (glibc)
+
+attached base packages:
+[1] grid      stats4    stats     graphics  grDevices utils     datasets  methods   base     
+
+other attached packages:
+ [1] VennDiagram_1.7.3           futile.logger_1.4.3         pcaExplorer_2.28.0         
+ [4] vsn_3.70.0                  RColorBrewer_1.1-3          magick_2.8.3               
+ [7] ellipse_0.5.0               ggrepel_0.9.5               ggpubr_0.6.0               
+[10] ggplot2_3.5.0               pheatmap_1.0.12             BiocParallel_1.36.0        
+[13] openxlsx_4.2.5.2            dplyr_1.1.4                 rtracklayer_1.62.0         
+[16] GenomicFeatures_1.54.4      AnnotationDbi_1.64.1        DESeq2_1.42.1              
+[19] SummarizedExperiment_1.32.0 Biobase_2.62.0              MatrixGenerics_1.14.0      
+[22] matrixStats_1.2.0           GenomicRanges_1.54.1        GenomeInfoDb_1.38.8        
+[25] IRanges_2.36.0              S4Vectors_0.40.2            BiocGenerics_0.48.1        
+
+loaded via a namespace (and not attached):
+  [1] splines_4.3.3            later_1.3.2              BiocIO_1.12.0            bitops_1.0-7            
+  [5] filelock_1.0.3           tibble_3.2.1             preprocessCore_1.64.0    graph_1.80.0            
+  [9] XML_3.99-0.16.1          lifecycle_1.0.4          rstatix_0.7.2            topGO_2.54.0            
+ [13] doParallel_1.0.17        lattice_0.22-6           crosstalk_1.2.1          dendextend_1.17.1       
+ [17] backports_1.4.1          magrittr_2.0.3           plotly_4.10.4            limma_3.58.1            
+ [21] rmarkdown_2.26           yaml_2.3.8               shinyBS_0.61.1           httpuv_1.6.15           
+ [25] NMF_0.27                 zip_2.3.1                ggvenn_0.1.10            DBI_1.2.2               
+ [29] abind_1.4-5              zlibbioc_1.48.2          purrr_1.0.2              RCurl_1.98-1.14         
+ [33] rappdirs_0.3.3           seriation_1.5.4          GenomeInfoDbData_1.2.11  AnnotationForge_1.44.0  
+ [37] genefilter_1.84.0        annotate_1.80.0          codetools_0.2-19         DelayedArray_0.28.0     
+ [41] DT_0.32                  xml2_1.3.6               tidyselect_1.2.1         GOstats_2.68.0          
+ [45] farver_2.1.1             viridis_0.6.5            TSP_1.2-4                BiocFileCache_2.10.1    
+ [49] base64enc_0.1-3          webshot_0.5.5            jsonlite_1.8.8           GenomicAlignments_1.38.2
+ [53] survival_3.5-8           iterators_1.0.14         systemfonts_1.0.6        foreach_1.5.2           
+ [57] tools_4.3.3              progress_1.2.3           ragg_1.3.0               Rcpp_1.0.12             
+ [61] glue_1.7.0               gridExtra_2.3            SparseArray_1.2.4        xfun_0.43               
+ [65] ca_0.71.1                shinydashboard_0.7.2     withr_3.0.0              formatR_1.14            
+ [69] Category_2.68.0          BiocManager_1.30.22      fastmap_1.1.1            fansi_1.0.6             
+ [73] SparseM_1.81             digest_0.6.35            R6_2.5.1                 mime_0.12               
+ [77] textshaping_0.3.7        colorspace_2.1-0         GO.db_3.18.0             biomaRt_2.58.2          
+ [81] RSQLite_2.3.5            threejs_0.3.3            utf8_1.2.4               tidyr_1.3.1             
+ [85] generics_0.1.3           hexbin_1.28.3            data.table_1.15.2        prettyunits_1.2.0       
+ [89] httr_1.4.7               htmlwidgets_1.6.4        S4Arrays_1.2.1           pkgconfig_2.0.3         
+ [93] gtable_0.3.4             blob_1.2.4               registry_0.5-1           XVector_0.42.0          
+ [97] htmltools_0.5.8          carData_3.0-5            RBGL_1.78.0              GSEABase_1.64.0         
+[101] scales_1.3.0             png_0.1-8                lambda.r_1.2.4           knitr_1.45              
+[105] rstudioapi_0.16.0        reshape2_1.4.4           rjson_0.2.21             curl_5.2.1              
+[109] shinyAce_0.4.2           cachem_1.0.8             stringr_1.5.1            parallel_4.3.3          
+[113] restfulr_0.0.15          pillar_1.9.0             vctrs_0.6.5              promises_1.2.1          
+[117] car_3.1-2                dbplyr_2.5.0             xtable_1.8-4             cluster_2.1.6           
+[121] Rgraphviz_2.46.0         evaluate_0.23            futile.options_1.0.1     cli_3.6.2               
+[125] locfit_1.5-9.9           compiler_4.3.3           Rsamtools_2.18.0         rlang_1.1.3             
+[129] crayon_1.5.2             rngtools_1.5.2           heatmaply_1.5.0          ggsignif_0.6.4          
+[133] labeling_0.4.3           affy_1.80.0              plyr_1.8.9               stringi_1.8.3           
+[137] viridisLite_0.4.2        gridBase_0.4-7           assertthat_0.2.1         munsell_0.5.0           
+[141] Biostrings_2.70.3        lazyeval_0.2.2           Matrix_1.6-5             hms_1.1.3               
+[145] bit64_4.0.5              KEGGREST_1.42.0          statmod_1.5.0            shiny_1.8.1             
+[149] igraph_2.0.3             broom_1.0.5              memoise_2.0.1            affyio_1.72.0           
+[153] bit_4.0.5 
+
